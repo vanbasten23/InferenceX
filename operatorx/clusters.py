@@ -16,6 +16,7 @@ CLUSTER_PLATFORMS: dict[str, str] = {
     "mi355x_8x":     "amd",
     "mi300x_amds_8x": "amd",
     "mi325x_amds_8x": "amd",
+    "tpu7x_4x":      "tpu",
 }
 
 CLUSTER_CHIPS: dict[str, str] = {
@@ -32,4 +33,5 @@ CLUSTER_CHIPS: dict[str, str] = {
     "mi355x_8x":     "mi355x",
     "mi300x_amds_8x": "mi300x",
     "mi325x_amds_8x": "mi325x",
+    "tpu7x_4x":      "tpu7x",
 }
