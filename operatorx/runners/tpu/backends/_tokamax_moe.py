@@ -75,8 +75,11 @@ def route(logits: jax.Array, cfg: MoeConfig, forced_ids: jax.Array | None = None
 
 
 def forced_ids(dist, tokens: int, experts: int, top_k: int, seed: int) -> np.ndarray:
-    """[tokens, top_k] expert ids with the requested load distribution (numpy port of
-    OperatorX's runners/common/vllm/moe.py:_forced_ids; same distributions, different RNG)."""
+    """builds a fixed table of which experts each token uses, shaped [tokens, top_k].
+    - balanced: Round-robin: every expert gets exactly the same number of picks.
+    - single_hot: Every token uses expert 0, plus 9 distinct random others.
+    - {"kind": "zipf", "s": 1.2}: Popular experts get far more tokens.
+    """
     rng = np.random.default_rng(seed)
     if dist == "balanced":  # round-robin: every expert gets tokens*top_k/experts slots
         ids = (np.arange(tokens * top_k) % experts).reshape(tokens, top_k)
@@ -96,14 +99,32 @@ def single_device_mesh() -> jax.sharding.Mesh:
 
 def moe_forward(p: dict, x: jax.Array, *, cfg: MoeConfig, mesh: jax.sharding.Mesh) -> jax.Array:
     """x [T, H] bf16 -> [T, H] bf16."""
+    # The first step of the MoE layer: a matmul that gives each token one score
+    # per expert, [T, H] @ [H, E] → logits [T, E].
     logits = jnp.matmul(x, p["w_router"])  # bf16 logits, as vLLM's GateLinear by default
-    w, ids = route(logits, cfg, p.get("forced_ids"))
+    w, ids = route(logits, cfg, p.get("forced_ids"))  # [T, top_k] for both.
     if cfg.shared:  # the shared expert as one more pick of every token
         if cfg.shared_gate:
+            # Below computes the weight of the shared expert for each token,
+            # where the "weight" means the number that scales an expert's
+            # output before the outputs are summed:
+            # out[t] = Σ_k  w[t,k] · expert_{ids[t,k]}(x[t])
+            # x @ w_shared_gate gives [T, H] @ [H, 1] → [T, 1].
+            # sigmoid squashes the score to between 0 and 1.
             sw = jax.nn.sigmoid(jnp.matmul(x, p["w_shared_gate"], preferred_element_type=_F32))
         else:
+            # Why jnp.ones without a gate: without a gate, the shared
+            # expert's output is added as-is, out = routed + shared(x).
+            # Since routing_moe multiplies every pick by its weight, a
+            # weight of 1 means "add unchanged". DeepSeek, GLM, Kimi
+            # and MiniMax have ungated shared experts.
             sw = jnp.ones((x.shape[0], 1), _F32)
         w = jnp.concatenate([w, sw.astype(w.dtype)], axis=-1)
+        # Why jnp.full_like(ids[:, :1], cfg.num_experts): [T, 1]
+        # NB: full_like(a, fill_value)
+        # - shared expert is appended after the 512 routed experts so its
+        # id is 512.
+        # - ids[:, :1] is a [T, 1] int32 slice
         ids = jnp.concatenate([ids, jnp.full_like(ids[:, :1], cfg.num_experts)], axis=-1)
     return modular.routing_moe(
         x, w, ids, p["w1"], p["w2"], p.get("w1_scale"), p.get("w2_scale"), None, None,
